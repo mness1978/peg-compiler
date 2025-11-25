@@ -1,0 +1,9 @@
+# Build artifacts
+*.o
+pegcc
+
+# Editor files
+*.swp
+*~
+.vscode/
+.idea/
