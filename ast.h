@@ -3,6 +3,10 @@
 
 #include <stddef.h> // For size_t
 
+#define RULE_FLAG_EXTENSIBLE 1
+#define RULE_FLAG_EXTEND 2
+
+
 // Forward declarations for linked lists
 typedef struct ASTNodeList ASTNodeList;
 typedef struct StringList StringList;
@@ -71,6 +75,7 @@ typedef struct ASTNode {
         // NODE_DEFINITION
         struct {
             char *identifier; // Rule name (string value is in node->value)
+            int flags; // RULE_FLAG_EXTENSIBLE | RULE_FLAG_EXTEND
             struct ASTNode *pre_expression_action; // Optional action before the expression
             struct ASTNode *expression; // Rule body
             struct ASTNode *post_expression_action; // Optional action after the expression

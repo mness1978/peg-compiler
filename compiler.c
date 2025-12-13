@@ -220,8 +220,19 @@ static int get_rule_id(CompilerContext *ctx, const char *rule_name) {
             return ctx->rules[i].id;
         }
     }
-    ctx->error_message = "Undefined rule reference (during ID lookup)";
     return -1; // Rule not found
+}
+
+// Helper to add an import (unresolved reference)
+static int add_import(CompilerContext *ctx, const char *name, int instruction_index) {
+    if (ctx->imports_ptr >= MAX_RULES) { // limiting imports same as rules for now
+         ctx->error_message = "Too many imports";
+         return -1;
+    }
+    ctx->imports[ctx->imports_ptr].name = strdup(name);
+    // Note: We don't check for strdup failure here for brevity, but should in production
+    ctx->imports[ctx->imports_ptr].instruction_index = instruction_index;
+    return ctx->imports_ptr++;
 }
 
 // Forward declarations for compilation functions
@@ -251,12 +262,12 @@ static int compile_primary(CompilerContext *ctx, ASTNode *node) {
         case NODE_IDENTIFIER: {
             int rule_id = get_rule_id(ctx, child->value);
             if (rule_id == -1) {
-                ctx->error_message = "Undefined rule in primary";
-                ctx->error_line = child->line;
-                ctx->error_column = child->column;
-                return 0;
+                // Undefined rule: treat as Import
+                emit_instruction(ctx, OP_CALL, -1); // Placeholder operand
+                if (add_import(ctx, child->value, ctx->bytecode_ptr - 1) == -1) return 0;
+            } else {
+                emit_instruction(ctx, OP_CALL, rule_id); // Emit rule_id, will be fixed up later
             }
-            emit_instruction(ctx, OP_CALL, rule_id); // Emit rule_id, will be fixed up later
             break;
         }
         case NODE_LITERAL: {
@@ -559,6 +570,7 @@ void compiler_init(CompilerContext *ctx) {
     ctx->error_message = NULL;
     ctx->error_line = 0;
     ctx->error_column = 0;
+    ctx->imports_ptr = 0;
 }
 
 int compiler_compile(CompilerContext *ctx, ASTNode *grammar_ast) {
@@ -577,9 +589,14 @@ int compiler_compile(CompilerContext *ctx, ASTNode *grammar_ast) {
             ctx->error_column = def_node->column;
             return 0;
         }
-        if (add_rule_definition(ctx, def_node->value, -1) == -1) { // -1 is a placeholder address
+        int rule_idx = add_rule_definition(ctx, def_node->value, -1);
+        if (rule_idx == -1) { // -1 is a placeholder address
             return 0; // Error message already set by add_rule_definition
         }
+        
+        ctx->rules[rule_idx].flags = def_node->data.definition.flags;
+        // printf("DEBUG: Rule '%s' has flags %d\n", ctx->rules[rule_idx].name, ctx->rules[rule_idx].flags);
+        
         current_def = current_def->next;
     }
 
@@ -596,6 +613,10 @@ int compiler_compile(CompilerContext *ctx, ASTNode *grammar_ast) {
     for (int i = 0; i < ctx->bytecode_ptr; ++i) {
         if (ctx->bytecode[i].opcode == OP_CALL) {
             int rule_id = ctx->bytecode[i].operand;
+            if (rule_id == -1) {
+                // Import, skip fixup (will be linked by VM)
+                continue;
+            }
             if (rule_id < 0 || rule_id >= ctx->rules_ptr) {
                 ctx->error_message = "Internal compiler error: invalid rule ID in OP_CALL";
                 return 0;
@@ -624,6 +645,15 @@ void compiler_cleanup(CompilerContext *ctx) {
 }
 
 int compiler_write_bytecode_file(CompilerContext *ctx, const char *filename) {
+    // Pre-process strings for Exports and Imports
+    // We need to ensure all rule names are in the string table before writing the header
+    for (int i = 0; i < ctx->rules_ptr; ++i) {
+        if (add_string(ctx, ctx->rules[i].name) == -1) return 0;
+    }
+    for (int i = 0; i < ctx->imports_ptr; ++i) {
+        if (add_string(ctx, ctx->imports[i].name) == -1) return 0;
+    }
+
     FILE *f = fopen(filename, "wb");
     if (!f) {
         perror("Failed to open bytecode file for writing");
@@ -637,7 +667,8 @@ int compiler_write_bytecode_file(CompilerContext *ctx, const char *filename) {
         !write_uint32_be(f, (uint32_t)ctx->string_table_ptr) ||
         !write_uint32_be(f, (uint32_t)ctx->char_class_table_ptr) ||
         !write_uint32_be(f, (uint32_t)ctx->action_table_ptr) ||
-        !write_uint32_be(f, (uint32_t)ctx->rules_ptr)) {
+        !write_uint32_be(f, (uint32_t)ctx->rules_ptr) || // Export Table Len
+        !write_uint32_be(f, (uint32_t)ctx->imports_ptr)) { // Import Table Len
         perror("Failed to write bytecode file header");
         fclose(f);
         return 0;
@@ -698,10 +729,24 @@ int compiler_write_bytecode_file(CompilerContext *ctx, const char *filename) {
         }
     }
 
-    // Write Rule Entry Points
+    // Write Export Table (Formerly Rule Entry Points, now NameIndex, Address, Flags)
     for (int i = 0; i < ctx->rules_ptr; ++i) {
-        if (!write_uint32_be(f, (uint32_t)ctx->rules[i].address)) {
-            perror("Failed to write rule entry point address");
+        int name_idx = add_string(ctx, ctx->rules[i].name); // Should be fast (found)
+        if (!write_uint32_be(f, (uint32_t)name_idx) ||
+            !write_uint32_be(f, (uint32_t)ctx->rules[i].address) ||
+            !write_uint32_be(f, (uint32_t)ctx->rules[i].flags)) {
+            perror("Failed to write export table entry");
+            fclose(f);
+            return 0;
+        }
+    }
+
+    // Write Import Table
+    for (int i = 0; i < ctx->imports_ptr; ++i) {
+        int name_idx = add_string(ctx, ctx->imports[i].name); // Should be fast (found)
+        if (!write_uint32_be(f, (uint32_t)name_idx) ||
+            !write_uint32_be(f, (uint32_t)ctx->imports[i].instruction_index)) {
+            perror("Failed to write import table entry");
             fclose(f);
             return 0;
         }

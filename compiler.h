@@ -19,8 +19,15 @@
 typedef struct {
     char *name;
     int address; // Starting address of the rule's bytecode
-    int id;      // Unique ID for the rule
+    int id;      // Unique ID for the rule (used as index in rules array)
+    int flags;   // Annotations (Extensible, Extend)
 } CompiledRule;
+
+// Structure to hold import information (unresolved references)
+typedef struct {
+    char *name;
+    int instruction_index; // Index of the OP_CALL instruction to patch
+} ImportEntry;
 
 // Compiler Context structure
 typedef struct CompilerContext {
@@ -40,9 +47,13 @@ typedef struct CompilerContext {
     uint32_t action_sizes[MAX_ACTIONS];
     int action_table_ptr;
 
-    // Rule management
+    // Rule management (Exports)
     CompiledRule rules[MAX_RULES];
     int rules_ptr;
+    
+    // Import management (Unresolved calls)
+    ImportEntry imports[MAX_RULES]; // Using MAX_RULES as a limit for imports too
+    int imports_ptr;
     // Mapping from rule name to rule ID/address (for lookup during compilation)
     // This will be built during the first pass.
     // For simplicity, a linear scan for now, but a hash map would be better.

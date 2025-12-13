@@ -227,6 +227,128 @@ static int parse_end_of_line(ParserContext *ctx);
 static int parse_end_of_file(ParserContext *ctx);
 static char parse_char_in_literal_or_class(ParserContext *ctx);
 
+static char parse_char_in_literal_or_class(ParserContext *ctx);
+
+// Helper to parse annotations like @extensible or @extend
+static int parse_annotation(ParserContext *ctx) {
+    size_t p_pos;
+    int p_line, p_col;
+    save_state(ctx, &p_pos, &p_line, &p_col);
+
+    if (!match_char(ctx, '@')) {
+        restore_state(ctx, p_pos, p_line, p_col);
+        return 0;
+    }
+    
+    char *ident = parse_identifier_text(ctx);
+    if (!ident) {
+         fprintf(stderr, "DEBUG WARNING: Annotation @ followed by invalid identifier at %d:%d\n", ctx->line, ctx->column);
+         restore_state(ctx, p_pos, p_line, p_col);
+         return 0;
+    }
+    
+    int flags = 0;
+    if (strcmp(ident, "extensible") == 0) {
+        flags = RULE_FLAG_EXTENSIBLE;
+    } else if (strcmp(ident, "extend") == 0) {
+        flags = RULE_FLAG_EXTEND;
+    }
+    
+    free(ident);
+    
+    if (flags == 0) {
+        fprintf(stderr, "DEBUG WARNING: Unknown annotation identifier at %d:%d\n", ctx->line, ctx->column);
+        // Unknown annotation, treat as failure (or could allow other annotations)
+        // For now, failure to strict check
+        restore_state(ctx, p_pos, p_line, p_col);
+        return 0;
+    }
+    
+    // parse_identifier_text already consumes trailing spacing
+    return flags;
+}
+
+static ASTNode *parse_definition(ParserContext *ctx) {
+    PARSER_DEBUG_LOG_ENTRY("parse_definition", ctx, NULL);
+    size_t p_pos;
+    int p_line, p_col;
+    save_state(ctx, &p_pos, &p_line, &p_col);
+
+    parse_spacing(ctx); // Consume leading spacing
+
+    // Parse Anotations
+    int flags = 0;
+    while(1) {
+        int f = parse_annotation(ctx);
+        if (f) {
+            flags |= f;
+        }
+        else break;
+    }
+
+    char *identifier_text = parse_identifier_text(ctx); // Matches Identifier
+    if (!identifier_text) {
+        restore_state(ctx, p_pos, p_line, p_col);
+        PARSER_DEBUG_LOG_EXIT("parse_definition", ctx, 0, NULL); // Failure
+        return NULL;
+    }
+    
+    parse_spacing(ctx); // Consume spacing before the first semantic action
+    ASTNode *pre_arrow_action = parse_semantic_action(ctx); // This is the first semantic action call
+
+    if (!match_literal(ctx, "<-")) { // LEFTARROW
+        free(identifier_text);
+        ast_free(pre_arrow_action); // Free if it was parsed
+        restore_state(ctx, p_pos, p_line, p_col);
+        ctx->error_message = "Expected '<-'";
+        ctx->error_line = ctx->line;
+        ctx->error_column = ctx->column;
+        PARSER_DEBUG_LOG_EXIT("parse_definition", ctx, 0, identifier_text); // Failure
+        return NULL;
+    }
+    parse_spacing(ctx);
+
+    ASTNode *expression = parse_expression(ctx);
+    if (!expression) {
+        free(identifier_text);
+        ast_free(pre_arrow_action);
+        restore_state(ctx, p_pos, p_line, p_col);
+        ctx->error_message = "Expected expression after '<-'";
+        ctx->error_line = ctx->line;
+        ctx->error_column = ctx->column;
+        PARSER_DEBUG_LOG_EXIT("parse_definition", ctx, 0, identifier_text); // Failure
+        return NULL;
+    }
+    
+    ASTNode *post_expression_action = parse_semantic_action(ctx); 
+
+    // Handle the '&{ YYACCEPT }' part. This is a trailing predicate with an action.
+    ASTNode *trailing_predicate_action = NULL;
+    size_t tp_pos;
+    int tp_line, tp_col;
+    save_state(ctx, &tp_pos, &tp_line, &tp_col);
+    
+    if (match_char(ctx, '&')) {
+        parse_spacing(ctx);
+        trailing_predicate_action = parse_semantic_action(ctx);
+        if (!trailing_predicate_action) {
+            restore_state(ctx, tp_pos, tp_line, tp_col);
+        }
+    } else {
+        restore_state(ctx, tp_pos, tp_line, tp_col);
+    }
+
+    ASTNode *definition_node = ast_new_node(NODE_DEFINITION, p_line, p_col);
+    definition_node->value = identifier_text; // Store identifier in node->value
+    definition_node->data.definition.flags = flags;
+    definition_node->data.definition.pre_expression_action = pre_arrow_action;
+    definition_node->data.definition.expression = expression;
+    definition_node->data.definition.post_expression_action = post_expression_action;
+    definition_node->data.definition.rule_predicate_action = trailing_predicate_action; 
+    
+    PARSER_DEBUG_LOG_EXIT("parse_definition", ctx, 1, identifier_text); // Success
+    return definition_node;
+}
 
 // Spacing <- ((' ' / '\t' / '\n' / '\r') / Comment)*
 static int parse_spacing(ParserContext *ctx) {
@@ -1204,109 +1326,7 @@ static ASTNode *parse_expression(ParserContext *ctx) {
     return expression_node;
 }
 
-static ASTNode *parse_definition(ParserContext *ctx) {
-    PARSER_DEBUG_LOG_ENTRY("parse_definition", ctx, NULL);
-    size_t p_pos;
-    int p_line, p_col;
-    save_state(ctx, &p_pos, &p_line, &p_col);
 
-    parse_spacing(ctx); // Consume leading spacing
-
-    char *identifier_text = parse_identifier_text(ctx); // Matches Identifier
-    if (!identifier_text) {
-        restore_state(ctx, p_pos, p_line, p_col);
-        PARSER_DEBUG_LOG_EXIT("parse_definition", ctx, 0, NULL); // Failure
-        return NULL;
-    }
-
-    parse_spacing(ctx); // Consume spacing before the first semantic action
-    // DEBUG: Print current position before matching first semantic action
-    // fprintf(stderr, "DEBUG: Before first semantic action at line %d, col %d. Char: '%c' (input_pos %zu)\n", ctx->line, ctx->column, ctx->input[ctx->current_pos], ctx->current_pos);
-    ASTNode *pre_arrow_action = parse_semantic_action(ctx); // This is the first semantic action call
-
-    if (!match_literal(ctx, "<-")) { // LEFTARROW
-        free(identifier_text);
-        ast_free(pre_arrow_action); // Free if it was parsed
-        restore_state(ctx, p_pos, p_line, p_col);
-        ctx->error_message = "Expected '<-'";
-        ctx->error_line = ctx->line;
-        ctx->error_column = ctx->column;
-        PARSER_DEBUG_LOG_EXIT("parse_definition", ctx, 0, identifier_text); // Failure
-        return NULL;
-    }
-    parse_spacing(ctx);
-
-    ASTNode *expression = parse_expression(ctx);
-    if (!expression) {
-        free(identifier_text);
-        ast_free(pre_arrow_action);
-        restore_state(ctx, p_pos, p_line, p_col);
-        ctx->error_message = "Expected expression after '<-'";
-        ctx->error_line = ctx->line;
-        ctx->error_column = ctx->column;
-        PARSER_DEBUG_LOG_EXIT("parse_definition", ctx, 0, identifier_text); // Failure
-        return NULL;
-    }
-
-    if (ctx->verbose) {
-        fprintf(stderr, "DEBUG_DEF: After expression - pos=%zu, line=%d, col=%d\n",
-                ctx->current_pos, ctx->line, ctx->column);
-    }
-    
-    ASTNode *post_expression_action = parse_semantic_action(ctx); // Optional semantic action after Expression
-
-    if (ctx->verbose) {
-        fprintf(stderr, "DEBUG_DEF: After post-expression action - pos=%zu, line=%d, col=%d\n",
-                ctx->current_pos, ctx->line, ctx->column);
-    }
-
-    // Handle the '&{ YYACCEPT }' part. This is a trailing predicate with an action.
-    // For now, we'll just parse the action if '&' is present.
-    ASTNode *trailing_predicate_action = NULL;
-    size_t tp_pos;
-    int tp_line, tp_col;
-    save_state(ctx, &tp_pos, &tp_line, &tp_col);
-    if (ctx->verbose) {
-        fprintf(stderr, "DEBUG_DEF: Before checking for '&' - pos=%zu, line=%d, col=%d, saved_pos=%zu\n",
-                ctx->current_pos, ctx->line, ctx->column, tp_pos);
-    }
-    
-    if (match_char(ctx, '&')) {
-        if (ctx->verbose) {
-            fprintf(stderr, "DEBUG_DEF: Matched '&' - pos=%zu\n", ctx->current_pos);
-        }
-        parse_spacing(ctx);
-        trailing_predicate_action = parse_semantic_action(ctx);
-        if (!trailing_predicate_action) {
-            // Matched '&' but no action, so backtrack
-            if (ctx->verbose) {
-                fprintf(stderr, "DEBUG_DEF: No action after '&', restoring to pos=%zu\n", tp_pos);
-            }
-            restore_state(ctx, tp_pos, tp_line, tp_col);
-        }
-    } else {
-        if (ctx->verbose) {
-            fprintf(stderr, "DEBUG_DEF: No '&' found, restoring to pos=%zu (current was %zu)\n", tp_pos, ctx->current_pos);
-        }
-        restore_state(ctx, tp_pos, tp_line, tp_col);
-    }
-
-    if (ctx->verbose) {
-        fprintf(stderr, "DEBUG_DEF: After trailing predicate handling - pos=%zu, line=%d, col=%d\n",
-                ctx->current_pos, ctx->line, ctx->column);
-    }
-
-
-
-    ASTNode *definition_node = ast_new_node(NODE_DEFINITION, p_line, p_col);
-    definition_node->value = identifier_text; // Store identifier in node->value
-    definition_node->data.definition.pre_expression_action = pre_arrow_action;
-    definition_node->data.definition.expression = expression;
-    definition_node->data.definition.post_expression_action = post_expression_action;
-    definition_node->data.definition.rule_predicate_action = trailing_predicate_action; // Store the &{ YYACCEPT } action
-    PARSER_DEBUG_LOG_EXIT("parse_definition", ctx, 1, identifier_text); // Success
-    return definition_node;
-}
 
 // Grammar <- Spacing Definition+ EndOfFile
 ASTNode *parse_grammar(ParserContext *ctx) {
